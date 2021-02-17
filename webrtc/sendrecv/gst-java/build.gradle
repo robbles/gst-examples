@@ -13,7 +13,7 @@ dependencies {
 
     // GStreamer
     compile "net.java.dev.jna:jna:5.2.0"
-    compile "org.freedesktop.gstreamer:gst1-java-core:0.9.4"
+    compile "org.freedesktop.gstreamer:gst1-java-core:1.4.0"
 
     // Websockets
     compile 'org.asynchttpclient:async-http-client:2.7.0'

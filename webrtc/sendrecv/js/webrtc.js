@@ -209,7 +209,7 @@ function getLocalStream() {
 
 function websocketServerConnect() {
     connect_attempts++;
-    if (connect_attempts > 3) {
+    if (connect_attempts > 60) {
         setError("Too many connection attempts, aborting. Refresh page to try again");
         return;
     }

@@ -9,11 +9,15 @@ import org.asynchttpclient.ws.WebSocketListener;
 import org.asynchttpclient.ws.WebSocketUpgradeHandler;
 import org.freedesktop.gstreamer.*;
 import org.freedesktop.gstreamer.Element.PAD_ADDED;
+import org.freedesktop.gstreamer.Pad;
+import org.freedesktop.gstreamer.PadProbeType;
 import org.freedesktop.gstreamer.elements.DecodeBin;
-import org.freedesktop.gstreamer.elements.WebRTCBin;
-import org.freedesktop.gstreamer.elements.WebRTCBin.CREATE_OFFER;
-import org.freedesktop.gstreamer.elements.WebRTCBin.ON_ICE_CANDIDATE;
-import org.freedesktop.gstreamer.elements.WebRTCBin.ON_NEGOTIATION_NEEDED;
+import org.freedesktop.gstreamer.webrtc.WebRTCBin;
+import org.freedesktop.gstreamer.webrtc.WebRTCBin.CREATE_OFFER;
+import org.freedesktop.gstreamer.webrtc.WebRTCBin.ON_ICE_CANDIDATE;
+import org.freedesktop.gstreamer.webrtc.WebRTCBin.ON_NEGOTIATION_NEEDED;
+import org.freedesktop.gstreamer.webrtc.WebRTCSessionDescription;
+import org.freedesktop.gstreamer.webrtc.WebRTCSDPType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,7 +33,30 @@ public class WebrtcSendRecv {
 
     private static final Logger logger = LoggerFactory.getLogger(WebrtcSendRecv.class);
     private static final String REMOTE_SERVER_URL = "wss://webrtc.nirbheek.in:8443";
-    private static final String VIDEO_BIN_DESCRIPTION = "videotestsrc ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay ! queue ! capsfilter caps=application/x-rtp,media=video,encoding-name=VP8,payload=97";
+
+    private static final String VIDEO_BIN_DESCRIPTION = String.join(
+        " ! ",
+        "videotestsrc",
+        "video/x-raw,width=320,height=480",
+        "clockoverlay",
+        "compositor name=mixer sink_0::alpha=1 sink_1::alpha=1 sink_1::xpos=20 sink_1::ypos=20",
+        "videoconvert",
+        "tee name=rtmp_tee",
+        "queue",
+        "vp8enc deadline=1",
+        "rtpvp8pay",
+        "queue",
+        "capsfilter caps=application/x-rtp,media=video,encoding-name=VP8,payload=97"
+    );
+
+    private static final String RTMP_BIN_DESCRIPTION = String.join(
+        " ! ",
+        "queue",
+        "x264enc",
+        "flvmux name=muxer",
+        "rtmpsink location=\"%s live=1\""
+    );
+
     private static final String AUDIO_BIN_DESCRIPTION = "audiotestsrc ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay ! queue ! capsfilter caps=application/x-rtp,media=audio,encoding-name=OPUS,payload=96";
 
     private final String serverUrl;
@@ -37,6 +64,9 @@ public class WebrtcSendRecv {
     private final ObjectMapper mapper = new ObjectMapper();
     private WebSocket websocket;
     private WebRTCBin webRTCBin;
+    private Bin videoTestSource;
+    private Bin audioTestSource;
+    private Element rtmpSink;
     private Pipeline pipe;
 
     public static void main(String[] args) throws Exception {
@@ -46,31 +76,47 @@ public class WebrtcSendRecv {
         }
         String serverUrl = REMOTE_SERVER_URL;
         String peerId = null;
+        String rtmpURI = "";
         for (int i=0; i<args.length; i++) {
             if (args[i].startsWith("--server=")) {
                 serverUrl = args[i].substring("--server=".length());
             } else if (args[i].startsWith("--peer-id=")) {
                 peerId = args[i].substring("--peer-id=".length());
+            } else if (args[i].startsWith("--rtmp-uri=")) {
+                rtmpURI = args[i].substring("--rtmp-uri=".length());
             }
         }
         logger.info("Using peer id {}, on server: {}", peerId, serverUrl);
-        WebrtcSendRecv webrtcSendRecv = new WebrtcSendRecv(peerId, serverUrl);
+        if(!rtmpURI.isEmpty()) {
+            logger.info("Sending to RTMP URI {}", rtmpURI);
+        } else {
+            logger.warn("Not sending to RTMP, no URI provided");
+        }
+        WebrtcSendRecv webrtcSendRecv = new WebrtcSendRecv(peerId, serverUrl, rtmpURI);
         webrtcSendRecv.startCall();
     }
 
-    private WebrtcSendRecv(String peerId, String serverUrl) {
+    private WebrtcSendRecv(String peerId, String serverUrl, String rtmpURI) {
         this.peerId = peerId;
         this.serverUrl = serverUrl;
-        Gst.init();
+        Gst.init(new Version(1, 14));
+
+        logger.info("Using gstreamer version {}", Gst.getVersionString());
         webRTCBin = new WebRTCBin("sendrecv");
 
-        Bin video = Gst.parseBinFromDescription(VIDEO_BIN_DESCRIPTION, true);
-        Bin audio = Gst.parseBinFromDescription(AUDIO_BIN_DESCRIPTION, true);
+        videoTestSource = Gst.parseBinFromDescription(VIDEO_BIN_DESCRIPTION, true);
+        audioTestSource = Gst.parseBinFromDescription(AUDIO_BIN_DESCRIPTION, true);
+        if(!rtmpURI.isEmpty()) {
+            rtmpSink = Gst.parseBinFromDescription(String.format(RTMP_BIN_DESCRIPTION, rtmpURI), true);
+            logger.info(String.format(RTMP_BIN_DESCRIPTION, rtmpURI));
+        } else {
+            rtmpSink = ElementFactory.make("fakesink", "dummy-rtmp-sink");
+        }
 
         pipe = new Pipeline();
-        pipe.addMany(webRTCBin, video, audio);
-        video.link(webRTCBin);
-        audio.link(webRTCBin);
+        pipe.addMany(webRTCBin, videoTestSource, audioTestSource);
+        videoTestSource.link(webRTCBin);
+        audioTestSource.link(webRTCBin);
         setupPipeLogging(pipe);
 
         // When the pipeline goes to PLAYING, the on_negotiation_needed() callback will be called, and we will ask webrtcbin to create an offer which will match the pipeline above.
@@ -110,6 +156,7 @@ public class WebrtcSendRecv {
         public void onClose(WebSocket websocket, int code, String reason) {
             logger.info("websocket onClose: " + code + " : " + reason);
             Gst.quit();
+            System.exit(0);
         }
 
         @Override
@@ -193,42 +240,57 @@ public class WebrtcSendRecv {
         }
     };
 
+
     private PAD_ADDED onIncomingDecodebinStream = (element, pad) -> {
-        logger.info("onIncomingDecodebinStream");
+        logger.info("onIncomingDecodebinStream from {}", element.getName());
         if (!pad.hasCurrentCaps()) {
             logger.info("Pad has no caps, ignoring: {}", pad.getName());
             return;
         }
-        Structure caps = pad.getCaps().getStructure(0);
+        Structure caps = pad.getCurrentCaps().getStructure(0);
         String name = caps.getName();
         if (name.startsWith("video")) {
             logger.info("onIncomingDecodebinStream video");
-            Element queue = ElementFactory.make("queue", "my-videoqueue");
-            Element videoconvert = ElementFactory.make("videoconvert", "my-videoconvert");
-            Element autovideosink = ElementFactory.make("autovideosink", "my-autovideosink");
-            pipe.addMany(queue, videoconvert, autovideosink);
-            queue.syncStateWithParent();
-            videoconvert.syncStateWithParent();
-            autovideosink.syncStateWithParent();
-            pad.link(queue.getStaticPad("sink"));
-            queue.link(videoconvert);
-            videoconvert.link(autovideosink);
+
+            // Bin that converts and scales video
+            Bin videotransform = Gst.parseBinFromDescription(String.join(
+                " ! ",
+                "queue",
+                "videoconvert",
+                "videoscale",
+                "video/x-raw,width=160,height=120",
+                "queue"
+            ), true);
+
+            pipe.addMany(videotransform, rtmpSink);
+            videotransform.syncStateWithParent();
+            rtmpSink.syncStateWithParent();
+
+            // Connect new pad to videotransform pipeline
+            pad.link(videotransform.getStaticPad("sink"));
+
+            // Connect to second sink on mixer
+            Element mixer = videoTestSource.getElementByName("mixer");
+            Element.linkPads(videotransform, "src", mixer, "sink_1");
+
+            Element rtmpTee = videoTestSource.getElementByName("rtmp_tee");
+            Element.linkPads(rtmpTee, "src_1", rtmpSink, "sink");
         }
         if (name.startsWith("audio")) {
             logger.info("onIncomingDecodebinStream audio");
             Element queue = ElementFactory.make("queue", "my-audioqueue");
             Element audioconvert = ElementFactory.make("audioconvert", "my-audioconvert");
             Element audioresample = ElementFactory.make("audioresample", "my-audioresample");
-            Element autoaudiosink = ElementFactory.make("autoaudiosink", "my-autoaudiosink");
-            pipe.addMany(queue, audioconvert, audioresample, autoaudiosink);
+            Element fakeaudiosink = ElementFactory.make("fakesink", "my-autoaudiosink");
+            pipe.addMany(queue, audioconvert, audioresample, fakeaudiosink);
             queue.syncStateWithParent();
             audioconvert.syncStateWithParent();
             audioresample.syncStateWithParent();
-            autoaudiosink.syncStateWithParent();
+            fakeaudiosink.syncStateWithParent();
             pad.link(queue.getStaticPad("sink"));
             queue.link(audioconvert);
             audioconvert.link(audioresample);
-            audioresample.link(autoaudiosink);
+            audioresample.link(fakeaudiosink);
         }
     };
 

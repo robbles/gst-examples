@@ -1,21 +1,22 @@
 version: '3'
 
 services:
-  # uncomment the sendrecv you would like to use
-  #
-  # sendrecv-gst:
-  #   build: ./sendrecv/gst
-  sendrecv-gst-java:
+
+  pipeline:
     build: ./sendrecv/gst-java
-  #sendrecv-gst-rust:
-  #  build: ./sendrecv/gst-rust
-  sendrecv-js:
+    command: java -jar /gst-java.jar --peer-id=1 --server=ws://signalling:8443 # --rtmp-uri=rtmp://sea.contribute.live-video.net/app/TWITCH_STREAM_KEY
+    environment:
+    - DISPLAY=host.docker.internal:0
+
+  client:
     build: ./sendrecv/js
     ports:
       - 8080:80
     depends_on:
       - signalling
+
   signalling:
     build: ./signalling
     ports:
       - 8443:8443
+    stop_grace_period: 1s
